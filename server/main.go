@@ -68,7 +68,7 @@ func handleMux(conn net.Conn, config *Config) {
 			var p2 net.Conn
 			var err error
 			if !isUnix {
-				p2, err = net.Dial("tcp", config.Target)
+				p2, err = net.Dial("udp", config.Target)
 			} else {
 				p2, err = net.Dial("unix", config.Target)
 			}

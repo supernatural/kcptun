@@ -3,12 +3,12 @@ package main
 import (
 	"crypto/sha1"
 	"fmt"
-	"io"
 	"log"
 	"math/rand"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
+    "net/netip"
 	"os"
 	"time"
 
@@ -34,38 +34,24 @@ const (
 var VERSION = "SELFBUILD"
 
 // handleClient aggregates connection p1 on mux with 'writeLock'
-func handleClient(session *smux.Session, p1 net.Conn, quiet bool) {
-	logln := func(v ...interface{}) {
-		if !quiet {
-			log.Println(v...)
-		}
-	}
-	defer p1.Close()
-	p2, err := session.OpenStream()
-	if err != nil {
-		logln(err)
-		return
-	}
+func handleClient(src *smux.Stream, dst *net.UDPConn, addr netip.AddrPort) {
+	log.Println("stream opened", "in:", src.RemoteAddr(), "out:", fmt.Sprint(dst.RemoteAddr(), "(", src.ID(), ")"))
+	defer log.Println("stream closed", "in:", src.RemoteAddr(), "out:", fmt.Sprint(dst.RemoteAddr(), "(", src.ID(), ")"))
 
-	defer p2.Close()
+    buf := make([]byte, bufSize)
+    for {
+        n, err := src.Read(buf)
+        if err != nil {
+            log.Fatalf("%+v", err)
+            return
+        }
 
-	logln("stream opened", "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.ID(), ")"))
-	defer logln("stream closed", "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.ID(), ")"))
-
-	// start tunnel & wait for tunnel termination
-	streamCopy := func(dst io.Writer, src io.ReadCloser) {
-		if _, err := generic.Copy(dst, src); err != nil {
-			// report protocol error
-			if err == smux.ErrInvalidProtocol {
-				log.Println("smux", err, "in:", p1.RemoteAddr(), "out:", fmt.Sprint(p2.RemoteAddr(), "(", p2.ID(), ")"))
-			}
-		}
-		p1.Close()
-		p2.Close()
-	}
-
-	go streamCopy(p1, p2)
-	streamCopy(p2, p1)
+        _, err = dst.WriteToUDPAddrPort(buf[:n], addr)
+        if err != nil {
+            log.Fatalf("%+v", err)
+            return
+        }
+    }
 }
 
 func checkError(err error) {
@@ -77,6 +63,7 @@ func checkError(err error) {
 
 type timedSession struct {
 	session    *smux.Session
+    stream     *smux.Stream
 	expiryDate time.Time
 }
 
@@ -309,25 +296,15 @@ func main() {
 		}
 
 		log.Println("version:", VERSION)
-		var listener net.Listener
-		var isUnix bool
-		if _, _, err := net.SplitHostPort(config.LocalAddr); err != nil {
-			isUnix = true
-		}
-		if isUnix {
-			addr, err := net.ResolveUnixAddr("unix", config.LocalAddr)
-			checkError(err)
-			listener, err = net.ListenUnix("unix", addr)
-			checkError(err)
-		} else {
-			addr, err := net.ResolveTCPAddr("tcp", config.LocalAddr)
-			checkError(err)
-			listener, err = net.ListenTCP("tcp", addr)
-			checkError(err)
-		}
+		var listener *net.UDPConn
+
+        addr, err := net.ResolveUDPAddr("udp", config.LocalAddr)
+        checkError(err)
+        listener, err = net.ListenUDP("udp", addr)
+        checkError(err)
 
 		log.Println("smux version:", config.SmuxVer)
-		log.Println("listening on:", listener.Addr())
+		log.Println("listening on:", listener.LocalAddr())
 		log.Println("encryption:", config.Crypt)
 		log.Println("nodelay parameters:", config.NoDelay, config.Interval, config.Resend, config.NoCongestion)
 		log.Println("remote address:", config.RemoteAddr)
@@ -461,28 +438,42 @@ func main() {
 		go scavenger(chScavenger, &config)
 
 		// start listener
-		numconn := uint16(config.Conn)
-		muxes := make([]timedSession, numconn)
-		rr := uint16(0)
+		muxes := make(map[netip.AddrPort]timedSession)
+        buf := make([]byte, bufSize)
 		for {
-			p1, err := listener.Accept()
+			n, raddr, err := listener.ReadFromUDPAddrPort(buf)
 			if err != nil {
 				log.Fatalf("%+v", err)
 			}
-			idx := rr % numconn
 
-			// do auto expiration && reconnection
-			if muxes[idx].session == nil || muxes[idx].session.IsClosed() ||
-				(config.AutoExpire > 0 && time.Now().After(muxes[idx].expiryDate)) {
-				muxes[idx].session = waitConn()
-				muxes[idx].expiryDate = time.Now().Add(time.Duration(config.AutoExpire) * time.Second)
-				if config.AutoExpire > 0 { // only when autoexpire set
-					chScavenger <- muxes[idx]
-				}
-			}
+            ts, ok := muxes[raddr]
+            if ok && ts.session != nil && config.AutoExpire > 0 &&
+                time.Now().After(ts.expiryDate) && !ts.session.IsClosed() {
+                ts.stream.Close()
+                ts.session.Close()
+                ok = false
+            }
+            if !ok || ts.session == nil || ts.session.IsClosed() {
+                ts = timedSession {
+                    session: waitConn(),
+                    stream: nil,
+                    expiryDate: time.Now().Add(time.Duration(config.AutoExpire) * time.Second),
+                }
 
-			go handleClient(muxes[idx].session, p1, config.Quiet)
-			rr++
+                ts.stream, err = ts.session.OpenStream()
+                if err != nil {
+                    log.Fatalf("%+v", err)
+                }
+
+                muxes[raddr] = ts
+                chScavenger <- ts
+
+                go handleClient(ts.stream, listener, raddr)
+            }
+            _, err = ts.stream.Write(buf[:n])
+            if err != nil {
+                log.Fatalf("%+v", err)
+            }
 		}
 	}
 	myApp.Run(os.Args)
@@ -503,6 +494,7 @@ func scavenger(ch chan timedSession, config *Config) {
 		case item := <-ch:
 			sessionList = append(sessionList, timedSession{
 				item.session,
+                item.stream,
 				item.expiryDate.Add(time.Duration(config.ScavengeTTL) * time.Second)})
 		case <-ticker.C:
 			if len(sessionList) == 0 {
